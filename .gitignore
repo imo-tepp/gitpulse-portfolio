@@ -1,0 +1,10 @@
+# Python environment tracking protections
+venv/
+ENV/
+.env
+__pycache__/
+*.pyc
+
+# IDE configurations
+.vscode/
+.idea/
