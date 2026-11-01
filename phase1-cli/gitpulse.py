@@ -76,7 +76,7 @@ def check_repo_health(repo_owner, repo_name):
         print ("Running unauthenticated. Rate limits will be heavily restricted.")
 
     # Query the main repository endpoint
-    api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}"
+    api_url = f"http://127.0.0.1:8000/proxy/{repo_owner}/{repo_name}"
 
     try:
         response = requests.get(api_url, headers=headers)
