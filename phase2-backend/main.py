@@ -1,8 +1,9 @@
 import os
 import json
+import time
 import redis
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, status
 from dotenv import load_dotenv
 
 # Load configurations globally
@@ -19,16 +20,62 @@ except redis.ConnectionError:
     print("Critical Infrastructure Error: Could not reach the Redis Docker container. Ensure Docker Desktop is active.")
     cache = None
 
+def check_rate_limit(client_ip: str) -> bool:
+    """
+    Implements a Sliding Window Rate Limiter inside Docker Redis memory.
+    Limits each unique IP address to 5 requests per minute.
+    Returns True if allowed, False if rate-limited
+    """
+    if not cache:
+        return True # Fallback safely if database is offline
+
+    rate_limit_key = f"ratelimit: {client_ip}"
+    current_time = time.time()
+    one_minute_ago = current_time - 60
+
+    # Create a pipeline to execute multiple Redis commands in a single network round-trip
+    pipeline = cache.pipeline()
+
+    # 1. Remove request timestamps older than 60 seconds
+    pipeline.zremrangebyscore(rate_limit_key, 0, one_minute_ago)
+    # 2. Add the current unique request timestamp to the sorted set
+    pipeline.zadd(rate_limit_key, {str(current_time): current_time})
+    # 3. Count how many total requests this IP has made within the active window
+    pipeline.zcard(rate_limit_key)
+    # 4. Set the tracking key to expire in 60 seconds so it cleans itself up
+    pipeline.expire(rate_limit_key, 60)
+
+    # Execute commands and pull the result from step 3 (index 2 in responses)
+    responses = pipeline.execute()
+    request_count = responses[2]
+
+    # Block the request if it exceeds our threshold
+    if request_count > 5:
+        return False
+
+    return True
+
 @app.get("/")
 def read_root():
     return {"status": "online", "gateway": "GitPulse Proxy Active"}
 
 @app.get("/proxy/{owner}/{repo}")
-def get_repository_data(owner: str, repo: str):
+def get_repository_data(owner: str, repo: str, request: Request):
     """
-    Acts as a secure reverse-proxy gateway. It intercepts requests,
-    checks the local high-speed memory cache, and handles outbound traffic.
+    Sticks strictly to the custom/proxy route. Validates traffic rates,
+    evalautes local memory cache, and handles outbound GitHub connections.
     """
+    client_ip = request.client.host
+    print(f"Custom Proxy Triggered by {client_ip} for: {owner}/{repo}")
+
+    # --- [ PROXIED FIREWALL CHECK ] ---
+    if not check_rate_limit(client_ip):
+        print(f"FIREWALL ALERT: Rate Limit Exceeded by IP: {client_ip}! Blocking request.")
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded. Gateway restriction: Maximum 5 requests per minute."
+        )
+
     cache_key = f"repo:{owner}:{repo}"
 
     # 1. Look inside the local Docker cache first to prevent outbound network calls
@@ -50,7 +97,7 @@ def get_repository_data(owner: str, repo: str):
 
     # Securely append your token if you have one configured in .env
     token = os.getenv("GITHUB_TOKEN")
-    if token:
+    if token and "your_github_token" not in token and token.strip() != "":
         headers["Authorization"] = f"Bearer {token.strip()}"
 
     response = requests.get(target_url, headers=headers)
